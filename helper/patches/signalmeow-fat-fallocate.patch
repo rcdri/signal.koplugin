@@ -1,0 +1,16 @@
+diff --git a/pkg/signalmeow/attachments.go b/pkg/signalmeow/attachments.go
+index d0ea3f3..34eb244 100644
+--- a/pkg/signalmeow/attachments.go
++++ b/pkg/signalmeow/attachments.go
+@@ -105,6 +105,11 @@ func DownloadAttachment(
+ 		}
+ 	} else {
+ 		err = fallocate.Fallocate(into, int(resp.ContentLength))
++		if err != nil && !errors.Is(err, fallocate.ErrOutOfSpace) {
++			// sig-helper patch: pre-allocation is only an optimisation, and FAT
++			// (the Kindle's user storage) doesn't support it.
++			err = nil
++		}
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to pre-allocate file for attachment: %w", err)
+ 		}

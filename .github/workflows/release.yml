@@ -1,0 +1,171 @@
+name: Release
+
+# Builds the ARM helper (signalmeow + libsignal, static musl) and publishes
+# signal.koplugin-vX.Y.Z.zip as a GitHub release. Run it from the Actions tab.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, without the v (e.g. 1.0.1)"
+        required: true
+        type: string
+      draft:
+        description: "Create the release as a draft"
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark as a pre-release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  # mautrix-signal (signalmeow) and, through its submodule, libsignal.
+  # helper/patches/ must apply to this commit.
+  MAUTRIX_REF: 11ede28800d50d1d4c5a2adaccf561609da576fb
+  RUST_TARGET: armv7-unknown-linux-musleabihf
+  ZIG_VERSION: 0.17.1
+  CARGO_ZIGBUILD_VERSION: 0.24.1
+  PROTOC_VERSION: "33.1"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Version must look like 1.2.3 or 1.2.3-beta.1 (got '$VERSION')"
+            exit 1
+          fi
+          echo "TAG=v$VERSION" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - name: Make sure the tag is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::$TAG already exists"
+            exit 1
+          fi
+
+      - name: Check out mautrix-signal and libsignal
+        uses: actions/checkout@v4
+        with:
+          repository: mautrix/signal
+          ref: ${{ env.MAUTRIX_REF }}
+          path: mautrix-signal
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: helper/go.mod
+          cache-dependency-path: helper/go.sum
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install zig, cargo-zigbuild, protoc and qemu
+        run: |
+          pip install "ziglang==$ZIG_VERSION" "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION"
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/protoc-$PROTOC_VERSION-linux-x86_64.zip"
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local
+          protoc --version
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-user-static
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mautrix-signal/pkg/libsignalgo/libsignal/target
+          key: libsignal-${{ env.RUST_TARGET }}-${{ env.MAUTRIX_REF }}-zig${{ env.ZIG_VERSION }}
+
+      - name: Build libsignal and zlib for ARM
+        working-directory: helper
+        env:
+          CROSS: ${{ github.workspace }}/helper/cross
+          PROTOC: /usr/local/bin/protoc
+        run: ./build-libsignal.sh
+
+      - name: Unit tests (ARM, under qemu)
+        working-directory: helper
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: arm
+          GOARM: "7"
+          CC: ${{ github.workspace }}/helper/cross/zcc
+          CXX: ${{ github.workspace }}/helper/cross/zcxx
+          CGO_CFLAGS: -O2 -I${{ github.workspace }}/helper/cross/arm/include
+          CGO_LDFLAGS: -L${{ github.workspace }}/helper/cross/arm/lib -lc++ -lunwind
+        run: |
+          go vet .
+          go test -c -tags netgo -ldflags "-linkmode external -extldflags -static" -o /tmp/sig.test .
+          qemu-arm-static /tmp/sig.test -test.v
+
+      - name: Build the helper
+        working-directory: helper
+        env:
+          CROSS: ${{ github.workspace }}/helper/cross
+          VERSION: ${{ inputs.version }}
+          OUT: ${{ github.workspace }}/bin/sig-helper-armhf
+        run: |
+          ./build-arm.sh
+          file "$OUT"
+          qemu-arm-static "$OUT" -version
+
+      - name: Package the plugin
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          mkdir -p dist/signal.koplugin/bin
+          cp _meta.lua main.lua sig_*.lua README.md LICENSE dist/signal.koplugin/
+          sed -i "s/version = \"dev\"/version = \"$VERSION\"/" dist/signal.koplugin/_meta.lua
+          grep -q "version = \"$VERSION\"" dist/signal.koplugin/_meta.lua
+          cp bin/sig-helper-armhf dist/signal.koplugin/bin/
+          chmod +x dist/signal.koplugin/bin/sig-helper-armhf
+          cd dist
+          zip -qr -9 "signal.koplugin-$TAG.zip" signal.koplugin
+          sha256sum "signal.koplugin-$TAG.zip" > SHA256SUMS
+          cat SHA256SUMS
+          ls -la
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          cat > notes.md <<EOF
+          ## Install
+
+          1. Download **signal.koplugin-$TAG.zip** below and unzip it.
+          2. Copy the \`signal.koplugin\` folder into \`koreader/plugins/\` (replace the old one when updating; your link and messages are kept in \`koreader/settings/signal/\`).
+          3. Restart KOReader, then open Tools → Signal.
+
+          The helper in \`bin/\` is built from \`helper/\` in this release's source, with [mautrix/signal@${MAUTRIX_REF:0:10}](https://github.com/mautrix/signal/tree/$MAUTRIX_REF) and the patches in \`helper/patches/\`.
+
+          EOF
+          flags=()
+          [ "$DRAFT" = "true" ] && flags+=(--draft)
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "Signal for KOReader $TAG" \
+            --notes-file notes.md \
+            --generate-notes \
+            "${flags[@]}" \
+            "dist/signal.koplugin-$TAG.zip" dist/SHA256SUMS

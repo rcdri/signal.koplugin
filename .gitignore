@@ -1,0 +1,7 @@
+# build outputs and inputs fetched by helper/build-libsignal.sh
+/bin/
+/mautrix-signal/
+/helper/cross/
+/helper/sig-helper-armhf
+/helper/*.test
+/dist/
